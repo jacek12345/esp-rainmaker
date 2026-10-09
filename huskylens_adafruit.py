@@ -125,6 +125,28 @@ class HuskyLensMCPClient:
         except (requests.RequestException, OSError) as exc:
             self._sse_error = exc
             self._endpoint_ready.set()
+        finally:
+            if not self._stop.is_set() and self._sse_error is None:
+                self._sse_error = RuntimeError("Strumień SSE kamery został zamknięty.")
+                self._endpoint_ready.set()
+
+    def _set_message_endpoint(self, endpoint):
+        if not isinstance(endpoint, str) or not endpoint:
+            return False
+
+        endpoint = urljoin(f"{self.server_url}/", endpoint)
+        parsed_endpoint = urlsplit(endpoint)
+        parsed_server = urlsplit(self.server_url)
+        if (
+            parsed_endpoint.scheme not in {"http", "https"}
+            or parsed_endpoint.netloc != parsed_server.netloc
+            or not parsed_endpoint.path.rstrip("/").endswith("/message")
+        ):
+            return False
+
+        self._message_url = endpoint
+        self._endpoint_ready.set()
+        return True
 
     def _handle_sse_data(self, data):
         if data == "[DONE]":
@@ -136,13 +158,15 @@ class HuskyLensMCPClient:
             message = data
 
         if isinstance(message, str):
-            endpoint = urljoin(f"{self.server_url}/", message)
-            if urlsplit(endpoint).path.rstrip("/").endswith("/message"):
-                self._message_url = endpoint
-                self._endpoint_ready.set()
+            self._set_message_endpoint(message)
             return
 
-        if isinstance(message, dict) and "id" in message:
+        if isinstance(message, dict):
+            for key in ("endpoint", "messageUrl", "message_url", "url"):
+                if self._set_message_endpoint(message.get(key)):
+                    return
+            if "id" not in message:
+                return
             with self._lock:
                 pending = self._pending.get(message["id"])
             if pending:
@@ -151,7 +175,9 @@ class HuskyLensMCPClient:
 
     def _send_request(self, method, params=None, timeout=15):
         if not self._message_url:
-            raise RuntimeError("Brak połączenia z sesją MCP.")
+            if not self._endpoint_ready.wait(timeout=10) or not self._message_url:
+                detail = f" Szczegóły SSE: {self._sse_error}" if self._sse_error else ""
+                raise RuntimeError(f"Brak adresu sesji MCP dla metody {method}.{detail}")
 
         with self._lock:
             self._request_id += 1
