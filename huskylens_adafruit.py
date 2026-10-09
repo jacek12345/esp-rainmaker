@@ -249,13 +249,20 @@ class HuskyLensMCPClient:
 
 def without_image_data(value):
     if isinstance(value, dict):
+        if value.get("type") == "image":
+            return None
         return {
             key: without_image_data(item)
             for key, item in value.items()
             if "image" not in key.lower().replace("_", "") and key.lower() not in {"frame", "photo"}
         }
     if isinstance(value, list):
-        return [without_image_data(item) for item in value]
+        cleaned_items = []
+        for item in value:
+            cleaned = without_image_data(item)
+            if cleaned is not None:
+                cleaned_items.append(cleaned)
+        return cleaned_items
     return value
 
 
@@ -325,7 +332,24 @@ def main():
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            payload = json.dumps(without_image_data(result), ensure_ascii=False, separators=(",", ":"))
+            clean_result = without_image_data(result)
+            print(f"\n[{time.strftime('%H:%M:%S')}] Wynik rozpoznawania HuskyLens:", flush=True)
+            content = clean_result.get("content")
+            if isinstance(content, list) and content:
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        print(item.get("text", ""), flush=True)
+                    elif isinstance(item, dict):
+                        print(json.dumps(item, ensure_ascii=False, indent=2), flush=True)
+                    else:
+                        print(item, flush=True)
+            else:
+                print(json.dumps(clean_result, ensure_ascii=False, indent=2), flush=True)
+
+            if not content and not any(key != "isError" for key in clean_result):
+                print("Brak danych rozpoznawania w odpowiedzi kamery.", flush=True)
+
+            payload = json.dumps(clean_result, ensure_ascii=False, separators=(",", ":"))
             now = time.monotonic()
 
             if payload != last_payload and now - last_publish >= MIN_PUBLISH_INTERVAL:
