@@ -197,6 +197,7 @@ class HuskyLensMCPClient:
                 "name": self._recognition_tool["name"],
                 "arguments": self._recognition_arguments,
             },
+            timeout=60,
         )
 
     def close(self):
@@ -276,7 +277,12 @@ def main():
         last_payload = None
         last_publish = 0.0
         while True:
-            response = camera.get_recognition_result()
+            try:
+                response = camera.get_recognition_result()
+            except TimeoutError as exc:
+                print(f"{exc} Sprawdzę kamerę ponownie.")
+                time.sleep(POLL_INTERVAL)
+                continue
 
             if "error" in response:
                 print(f"Błąd MCP: {response['error']}")
