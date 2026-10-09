@@ -40,6 +40,8 @@ class HuskyLensMCPClient:
         self._request_id = 0
         self._sse_thread = None
         self._sse_response = None
+        self._recognition_tool = None
+        self._recognition_arguments = {}
 
     def connect(self):
         self._sse_thread = threading.Thread(target=self._listen_sse, daemon=True)
@@ -61,6 +63,40 @@ class HuskyLensMCPClient:
         if "error" in response:
             raise RuntimeError(f"Inicjalizacja MCP nie powiodła się: {response['error']}")
         self._send_notification("notifications/initialized")
+
+        response = self._send_request("tools/list")
+        if "error" in response:
+            raise RuntimeError(f"Nie udało się pobrać listy narzędzi MCP: {response['error']}")
+
+        tools = response.get("result", {}).get("tools", [])
+        names = [tool.get("name", "<bez nazwy>") for tool in tools]
+        print(f"Narzędzia MCP kamery: {', '.join(names) if names else 'brak'}")
+
+        candidates = []
+        for tool in tools:
+            name = tool.get("name", "")
+            description = tool.get("description", "")
+            searchable = f"{name} {description}".casefold()
+            if "recognition" in searchable or "recognize" in searchable:
+                score = 0 if name.casefold() == "get_recognition_result" else 1
+                candidates.append((score, tool))
+
+        if not candidates:
+            raise RuntimeError(
+                "Ta kamera nie udostępnia rozpoznawalnego narzędzia rozpoznawania "
+                f"(dostępne: {', '.join(names) if names else 'brak'}). "
+                "Sprawdź wersję firmware i włącz MCP Server w kamerze."
+            )
+
+        _, self._recognition_tool = min(candidates, key=lambda candidate: candidate[0])
+        schema = self._recognition_tool.get("inputSchema", {})
+        properties = schema.get("properties", {})
+        if "operation" in properties:
+            allowed = properties["operation"].get("enum", [])
+            operation = "get_result" if "get_result" in allowed or not allowed else allowed[0]
+            self._recognition_arguments["operation"] = operation
+
+        print(f"Wybrane narzędzie rozpoznawania: {self._recognition_tool['name']}")
 
     def _listen_sse(self):
         try:
@@ -153,11 +189,13 @@ class HuskyLensMCPClient:
         response.raise_for_status()
 
     def get_recognition_result(self):
+        if self._recognition_tool is None:
+            raise RuntimeError("Nie wykryto narzędzia rozpoznawania HuskyLens.")
         return self._send_request(
             "tools/call",
             {
-                "name": "get_recognition_result",
-                "arguments": {"operation": "get_result"},
+                "name": self._recognition_tool["name"],
+                "arguments": self._recognition_arguments,
             },
         )
 
