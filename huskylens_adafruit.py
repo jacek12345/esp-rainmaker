@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Forward HUSKYLENS 2 recognition results to Adafruit IO.
 
-Requires ``requests`` and ``paho-mqtt>=2``. Set ``ADAFRUIT_IO_KEY`` before
-running; ``HUSKYLENS_URL`` and ``ADAFRUIT_IO_USERNAME`` can override defaults.
+Requires ``requests`` and ``paho-mqtt>=2``. Replace ``AIO_KEY`` below with your
+test key; ``HUSKYLENS_URL`` and ``ADAFRUIT_IO_USERNAME`` can override defaults.
 """
 
 import json
@@ -19,7 +19,7 @@ from paho.mqtt import client as mqtt_client
 
 CAMERA_URL = os.getenv("HUSKYLENS_URL", "http://192.168.1.135:3000").rstrip("/")
 AIO_USERNAME = os.getenv("ADAFRUIT_IO_USERNAME", "jacekAF")
-AIO_KEY = os.getenv("ADAFRUIT_IO_KEY")
+AIO_KEY = "PASTE_TEST_KEY_HERE"
 FEED_TOPIC = f"{AIO_USERNAME}/feeds/tablice"
 POLL_INTERVAL = 1.0
 MIN_PUBLISH_INTERVAL = 2.1
@@ -195,8 +195,8 @@ def without_image_data(value):
 
 
 def connect_mqtt():
-    if not AIO_KEY:
-        raise RuntimeError("Ustaw klucz w zmiennej środowiskowej ADAFRUIT_IO_KEY.")
+    if AIO_KEY == "PASTE_TEST_KEY_HERE":
+        raise RuntimeError("Wpisz testowy klucz Adafruit IO w zmiennej AIO_KEY na początku skryptu.")
 
     connected = threading.Event()
     connection_error = []
