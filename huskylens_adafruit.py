@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""Forward HUSKYLENS 2 recognition results to an Adafruit IO feed."""
+"""Forward HUSKYLENS 2 recognition results to Adafruit IO.
+
+Requires ``requests`` and ``paho-mqtt>=2``. Set ``ADAFRUIT_IO_KEY`` before
+running; ``HUSKYLENS_URL`` and ``ADAFRUIT_IO_USERNAME`` can override defaults.
+"""
 
 import json
 import os
+import socket
 import threading
 import time
 import uuid
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import requests
 from paho.mqtt import client as mqtt_client
@@ -19,7 +24,6 @@ FEED_TOPIC = f"{AIO_USERNAME}/feeds/tablice"
 POLL_INTERVAL = 1.0
 MIN_PUBLISH_INTERVAL = 2.1
 MAX_FEED_PAYLOAD_BYTES = 1024
-IMAGE_KEYS = {"image", "image_data", "image_data_base64", "frame", "photo"}
 
 
 class HuskyLensMCPClient:
@@ -70,7 +74,7 @@ class HuskyLensMCPClient:
                 self._sse_response = response
                 data_lines = []
 
-                for line in response.iter_lines(decode_unicode=True):
+                for line in response.iter_lines(chunk_size=1, decode_unicode=True):
                     if self._stop.is_set():
                         break
                     if isinstance(line, bytes):
@@ -93,8 +97,12 @@ class HuskyLensMCPClient:
         try:
             message = json.loads(data)
         except ValueError:
-            if data.startswith("/message") or "/message?" in data:
-                self._message_url = urljoin(f"{self.server_url}/", data)
+            message = data
+
+        if isinstance(message, str):
+            endpoint = urljoin(f"{self.server_url}/", message)
+            if urlsplit(endpoint).path.rstrip("/").endswith("/message"):
+                self._message_url = endpoint
                 self._endpoint_ready.set()
             return
 
@@ -156,9 +164,20 @@ class HuskyLensMCPClient:
     def close(self):
         self._stop.set()
         if self._sse_response is not None:
-            self._sse_response.close()
+            connection = getattr(self._sse_response.raw, "_connection", None)
+            sock = getattr(connection, "sock", None)
+            if sock is None:
+                fp = getattr(self._sse_response.raw, "_fp", None)
+                file_pointer = getattr(fp, "fp", None)
+                raw_socket = getattr(file_pointer, "raw", None)
+                sock = getattr(raw_socket, "_sock", None)
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
         if self._sse_thread is not None:
-            self._sse_thread.join(timeout=2)
+            self._sse_thread.join(timeout=1)
         self._session.close()
         self._sse_session.close()
 
@@ -168,7 +187,7 @@ def without_image_data(value):
         return {
             key: without_image_data(item)
             for key, item in value.items()
-            if key.lower() not in IMAGE_KEYS
+            if "image" not in key.lower().replace("_", "") and key.lower() not in {"frame", "photo"}
         }
     if isinstance(value, list):
         return [without_image_data(item) for item in value]
@@ -223,30 +242,37 @@ def main():
 
             if "error" in response:
                 print(f"Błąd MCP: {response['error']}")
-            else:
-                result = response.get("result", {})
-                payload = json.dumps(
-                    without_image_data(result),
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
-                now = time.monotonic()
+                time.sleep(POLL_INTERVAL)
+                continue
 
-                if payload != last_payload and now - last_publish >= MIN_PUBLISH_INTERVAL:
-                    if len(payload.encode("utf-8")) > MAX_FEED_PAYLOAD_BYTES:
-                        print("Wynik przekracza limit feedu Adafruit IO (1024 bajty); pominięto.")
-                    else:
-                        info = mqtt.publish(FEED_TOPIC, payload, qos=0)
-                        if info.rc == mqtt_client.MQTT_ERR_SUCCESS:
-                            info.wait_for_publish(timeout=10)
-                            if info.is_published():
-                                print(f"Wysłano do {FEED_TOPIC}: {payload}")
-                                last_payload = payload
-                                last_publish = time.monotonic()
-                            else:
-                                print("Nie potwierdzono publikacji MQTT.")
+            result = response.get("result", {})
+            if not isinstance(result, dict):
+                print("Nieprawidłowa odpowiedź MCP: brak obiektu result.")
+                time.sleep(POLL_INTERVAL)
+                continue
+            if result.get("isError"):
+                print(f"Błąd narzędzia HuskyLens: {result.get('content', result)}")
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            payload = json.dumps(without_image_data(result), ensure_ascii=False, separators=(",", ":"))
+            now = time.monotonic()
+
+            if payload != last_payload and now - last_publish >= MIN_PUBLISH_INTERVAL:
+                if len(payload.encode("utf-8")) > MAX_FEED_PAYLOAD_BYTES:
+                    print("Wynik przekracza limit feedu Adafruit IO (1024 bajty); pominięto.")
+                else:
+                    info = mqtt.publish(FEED_TOPIC, payload, qos=0)
+                    if info.rc == mqtt_client.MQTT_ERR_SUCCESS:
+                        info.wait_for_publish(timeout=10)
+                        if info.is_published():
+                            print(f"Wysłano do {FEED_TOPIC}: {payload}")
+                            last_payload = payload
+                            last_publish = time.monotonic()
                         else:
-                            print(f"Błąd publikacji MQTT: {info.rc}")
+                            print("Nie potwierdzono publikacji MQTT.")
+                    else:
+                        print(f"Błąd publikacji MQTT: {info.rc}")
 
             time.sleep(POLL_INTERVAL)
     except KeyboardInterrupt:
