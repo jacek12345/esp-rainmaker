@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+"""Forward HUSKYLENS 2 recognition results to Adafruit IO.
+
+Requires ``requests`` and ``paho-mqtt>=2``. Replace ``AIO_KEY`` below with your
+test key; ``HUSKYLENS_URL`` and ``ADAFRUIT_IO_USERNAME`` can override defaults.
+"""
+
+import json
+import os
+import socket
+import threading
+import time
+import uuid
+from urllib.parse import urljoin, urlsplit
+
+import requests
+from paho.mqtt import client as mqtt_client
+
+
+CAMERA_URL = os.getenv("HUSKYLENS_URL", "http://192.168.1.135:3000").rstrip("/")
+AIO_USERNAME = os.getenv("ADAFRUIT_IO_USERNAME", "jacekAF")
+AIO_KEY = "PASTE_TEST_KEY_HERE"
+FEED_TOPIC = f"{AIO_USERNAME}/feeds/tablice"
+POLL_INTERVAL = 1.0
+MIN_PUBLISH_INTERVAL = 2.1
+MAX_FEED_PAYLOAD_BYTES = 1024
+
+
+class HuskyLensMCPClient:
+    def __init__(self, server_url):
+        self.server_url = server_url.rstrip("/")
+        self._session = requests.Session()
+        self._sse_session = requests.Session()
+        self._message_url = None
+        self._pending = {}
+        self._lock = threading.Lock()
+        self._endpoint_ready = threading.Event()
+        self._stop = threading.Event()
+        self._sse_error = None
+        self._request_id = 0
+        self._sse_thread = None
+        self._sse_response = None
+        self._recognition_tool = None
+        self._recognition_arguments = {}
+
+    def connect(self):
+        self._sse_thread = threading.Thread(target=self._listen_sse, daemon=True)
+        self._sse_thread.start()
+
+        if not self._endpoint_ready.wait(timeout=10):
+            if self._sse_error:
+                raise RuntimeError(f"Nie udało się otworzyć strumienia MCP: {self._sse_error}")
+            raise RuntimeError("HuskyLens nie przekazał adresu sesji MCP przez SSE.")
+
+        response = self._send_request(
+            "initialize",
+            {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "HuskyLens-Adafruit", "version": "1.0.0"},
+            },
+        )
+        if "error" in response:
+            raise RuntimeError(f"Inicjalizacja MCP nie powiodła się: {response['error']}")
+        self._send_notification("notifications/initialized")
+
+        response = self._send_request("tools/list")
+        if "error" in response:
+            raise RuntimeError(f"Nie udało się pobrać listy narzędzi MCP: {response['error']}")
+
+        tools = response.get("result", {}).get("tools", [])
+        names = [tool.get("name", "<bez nazwy>") for tool in tools]
+        print(f"Narzędzia MCP kamery: {', '.join(names) if names else 'brak'}")
+
+        candidates = []
+        for tool in tools:
+            name = tool.get("name", "")
+            description = tool.get("description", "")
+            searchable = f"{name} {description}".casefold()
+            if "recognition" in searchable or "recognize" in searchable:
+                score = 0 if name.casefold() == "get_recognition_result" else 1
+                candidates.append((score, tool))
+
+        if not candidates:
+            raise RuntimeError(
+                "Ta kamera nie udostępnia rozpoznawalnego narzędzia rozpoznawania "
+                f"(dostępne: {', '.join(names) if names else 'brak'}). "
+                "Sprawdź wersję firmware i włącz MCP Server w kamerze."
+            )
+
+        _, self._recognition_tool = min(candidates, key=lambda candidate: candidate[0])
+        schema = self._recognition_tool.get("inputSchema", {})
+        properties = schema.get("properties", {})
+        if "operation" in properties:
+            allowed = properties["operation"].get("enum", [])
+            operation = "get_result" if "get_result" in allowed or not allowed else allowed[0]
+            self._recognition_arguments["operation"] = operation
+
+        print(f"Wybrane narzędzie rozpoznawania: {self._recognition_tool['name']}")
+
+    def _listen_sse(self):
+        try:
+            with self._sse_session.get(
+                f"{self.server_url}/sse",
+                headers={"Accept": "text/event-stream"},
+                stream=True,
+                timeout=(5, None),
+            ) as response:
+                response.raise_for_status()
+                self._sse_response = response
+                data_lines = []
+
+                for line in response.iter_lines(chunk_size=1, decode_unicode=True):
+                    if self._stop.is_set():
+                        break
+                    if isinstance(line, bytes):
+                        line = line.decode("utf-8", errors="replace")
+                    if not line:
+                        if data_lines:
+                            self._handle_sse_data("\n".join(data_lines))
+                            data_lines.clear()
+                        continue
+                    if line.startswith("data:"):
+                        data_lines.append(line[5:].lstrip())
+        except (requests.RequestException, OSError) as exc:
+            self._sse_error = exc
+            self._endpoint_ready.set()
+        finally:
+            if not self._stop.is_set() and self._sse_error is None:
+                self._sse_error = RuntimeError("Strumień SSE kamery został zamknięty.")
+                self._endpoint_ready.set()
+
+    def _set_message_endpoint(self, endpoint):
+        if not isinstance(endpoint, str) or not endpoint:
+            return False
+
+        endpoint = urljoin(f"{self.server_url}/", endpoint)
+        parsed_endpoint = urlsplit(endpoint)
+        parsed_server = urlsplit(self.server_url)
+        if (
+            parsed_endpoint.scheme not in {"http", "https"}
+            or parsed_endpoint.netloc != parsed_server.netloc
+            or not parsed_endpoint.path.rstrip("/").endswith("/message")
+        ):
+            return False
+
+        self._message_url = endpoint
+        self._endpoint_ready.set()
+        return True
+
+    def _handle_sse_data(self, data):
+        if data == "[DONE]":
+            return
+
+        try:
+            message = json.loads(data)
+        except ValueError:
+            message = data
+
+        if isinstance(message, str):
+            self._set_message_endpoint(message)
+            return
+
+        if isinstance(message, dict):
+            for key in ("endpoint", "messageUrl", "message_url", "url"):
+                if self._set_message_endpoint(message.get(key)):
+                    return
+            if "id" not in message:
+                return
+            with self._lock:
+                pending = self._pending.get(message["id"])
+            if pending:
+                pending["response"] = message
+                pending["event"].set()
+
+    def _send_request(self, method, params=None, timeout=15):
+        if not self._message_url:
+            if not self._endpoint_ready.wait(timeout=10) or not self._message_url:
+                detail = f" Szczegóły SSE: {self._sse_error}" if self._sse_error else ""
+                raise RuntimeError(f"Brak adresu sesji MCP dla metody {method}.{detail}")
+
+        with self._lock:
+            self._request_id += 1
+            request_id = self._request_id
+            pending = {"event": threading.Event(), "response": None}
+            self._pending[request_id] = pending
+
+        payload = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": params or {},
+        }
+        try:
+            response = self._session.post(
+                self._message_url,
+                json=payload,
+                headers={"Accept": "application/json, text/event-stream"},
+                timeout=10,
+            )
+            response.raise_for_status()
+            if not pending["event"].wait(timeout=timeout):
+                raise TimeoutError(f"Brak odpowiedzi MCP dla metody {method}.")
+            return pending["response"] or {}
+        finally:
+            with self._lock:
+                self._pending.pop(request_id, None)
+
+    def _send_notification(self, method, params=None):
+        response = self._session.post(
+            self._message_url,
+            json={"jsonrpc": "2.0", "method": method, "params": params or {}},
+            timeout=10,
+        )
+        response.raise_for_status()
+
+    def get_recognition_result(self):
+        if self._recognition_tool is None:
+            raise RuntimeError("Nie wykryto narzędzia rozpoznawania HuskyLens.")
+        return self._send_request(
+            "tools/call",
+            {
+                "name": self._recognition_tool["name"],
+                "arguments": self._recognition_arguments,
+            },
+            timeout=60,
+        )
+
+    def close(self):
+        self._stop.set()
+        if self._sse_response is not None:
+            connection = getattr(self._sse_response.raw, "_connection", None)
+            sock = getattr(connection, "sock", None)
+            if sock is None:
+                fp = getattr(self._sse_response.raw, "_fp", None)
+                file_pointer = getattr(fp, "fp", None)
+                raw_socket = getattr(file_pointer, "raw", None)
+                sock = getattr(raw_socket, "_sock", None)
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+        if self._sse_thread is not None:
+            self._sse_thread.join(timeout=1)
+        self._session.close()
+        self._sse_session.close()
+
+
+def without_image_data(value):
+    if isinstance(value, dict):
+        if value.get("type") == "image":
+            return None
+        return {
+            key: without_image_data(item)
+            for key, item in value.items()
+            if "image" not in key.lower().replace("_", "") and key.lower() not in {"frame", "photo"}
+        }
+    if isinstance(value, list):
+        cleaned_items = []
+        for item in value:
+            cleaned = without_image_data(item)
+            if cleaned is not None:
+                cleaned_items.append(cleaned)
+        return cleaned_items
+    return value
+
+
+def connect_mqtt():
+    if AIO_KEY == "PASTE_TEST_KEY_HERE":
+        raise RuntimeError("Wpisz testowy klucz Adafruit IO w zmiennej AIO_KEY na początku skryptu.")
+
+    connected = threading.Event()
+    connection_error = []
+    client = mqtt_client.Client(
+        callback_api_version=mqtt_client.CallbackAPIVersion.VERSION2,
+        client_id=f"huskylens-{uuid.uuid4().hex[:8]}",
+    )
+    client.username_pw_set(AIO_USERNAME, AIO_KEY)
+    client.tls_set()
+
+    def on_connect(_client, _userdata, _flags, reason_code, _properties):
+        if reason_code.is_failure:
+            connection_error.append(reason_code)
+        else:
+            connected.set()
+
+    client.on_connect = on_connect
+    client.connect("io.adafruit.com", 8883, keepalive=60)
+    client.loop_start()
+
+    if not connected.wait(timeout=10):
+        client.loop_stop()
+        client.disconnect()
+        if connection_error:
+            raise RuntimeError(f"Połączenie z Adafruit IO nie powiodło się: {connection_error[0]}")
+        raise RuntimeError("Przekroczono czas oczekiwania na połączenie z Adafruit IO.")
+    return client
+
+
+def main():
+    mqtt = None
+    camera = HuskyLensMCPClient(CAMERA_URL)
+
+    try:
+        mqtt = connect_mqtt()
+        camera.connect()
+        print(f"Połączono. Odczyt wyników z {CAMERA_URL}")
+
+        last_payload = None
+        last_publish = 0.0
+        while True:
+            try:
+                response = camera.get_recognition_result()
+            except TimeoutError as exc:
+                print(f"{exc} Sprawdzę kamerę ponownie.")
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            if "error" in response:
+                print(f"Błąd MCP: {response['error']}")
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            result = response.get("result", {})
+            if not isinstance(result, dict):
+                print("Nieprawidłowa odpowiedź MCP: brak obiektu result.")
+                time.sleep(POLL_INTERVAL)
+                continue
+            if result.get("isError"):
+                print(f"Błąd narzędzia HuskyLens: {result.get('content', result)}")
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            clean_result = without_image_data(result)
+            print(f"\n[{time.strftime('%H:%M:%S')}] Wynik rozpoznawania HuskyLens:", flush=True)
+            content = clean_result.get("content")
+            if isinstance(content, list) and content:
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        print(item.get("text", ""), flush=True)
+                    elif isinstance(item, dict):
+                        print(json.dumps(item, ensure_ascii=False, indent=2), flush=True)
+                    else:
+                        print(item, flush=True)
+            else:
+                print(json.dumps(clean_result, ensure_ascii=False, indent=2), flush=True)
+
+            if not content and not any(key != "isError" for key in clean_result):
+                print("Brak danych rozpoznawania w odpowiedzi kamery.", flush=True)
+
+            payload = json.dumps(clean_result, ensure_ascii=False, separators=(",", ":"))
+            now = time.monotonic()
+
+            if payload != last_payload and now - last_publish >= MIN_PUBLISH_INTERVAL:
+                if len(payload.encode("utf-8")) > MAX_FEED_PAYLOAD_BYTES:
+                    print("Wynik przekracza limit feedu Adafruit IO (1024 bajty); pominięto.")
+                else:
+                    info = mqtt.publish(FEED_TOPIC, payload, qos=0)
+                    if info.rc == mqtt_client.MQTT_ERR_SUCCESS:
+                        info.wait_for_publish(timeout=10)
+                        if info.is_published():
+                            print(f"Wysłano do {FEED_TOPIC}: {payload}")
+                            last_payload = payload
+                            last_publish = time.monotonic()
+                        else:
+                            print("Nie potwierdzono publikacji MQTT.")
+                    else:
+                        print(f"Błąd publikacji MQTT: {info.rc}")
+
+            time.sleep(POLL_INTERVAL)
+    except KeyboardInterrupt:
+        print("\nZatrzymano.")
+    except (OSError, requests.RequestException, RuntimeError, TimeoutError) as exc:
+        print(f"Błąd: {exc}")
+    finally:
+        camera.close()
+        if mqtt is not None:
+            mqtt.loop_stop()
+            mqtt.disconnect()
+
+
+if __name__ == "__main__":
+    main()
